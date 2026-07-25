@@ -1,0 +1,80 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "🚀 Launch Full Sentinel-JVM Stack (1-Click)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_stack.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "java",
+      "name": "1. Spring Boot Gateway (Java 21)",
+      "request": "launch",
+      "mainClass": "com.sentinel.gateway.SentinelGatewayApplication",
+      "shortenCommandLine": "none",
+      "classPaths": [
+        "${workspaceFolder}/gateway/target/sentinel-gateway-1.0.0.jar"
+      ],
+      "cwd": "${workspaceFolder}/gateway",
+      "env": {
+        "SPRING_DATA_MONGODB_URI": "mongodb+srv://anishsnilajkar_db_user:pubg1234@cluster0.tkv4bqk.mongodb.net/sentinel_db?retryWrites=true&w=majority",
+        "ML_SERVICE_URL": "http://localhost:5000"
+      }
+    },
+    {
+      "name": "2. Python FastAPI ML Microservice",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/ml-service/main.py",
+      "cwd": "${workspaceFolder}/ml-service",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "3. mitmproxy Interceptor Addon",
+      "type": "python",
+      "request": "launch",
+      "program": "C:/Users/Anish Nilajkar/AppData/Local/Python/pythoncore-3.14-64/Scripts/mitmdump.exe",
+      "args": [
+        "-s",
+        "${workspaceFolder}/mitmproxy-addon/sentinel_addon.py",
+        "--listen-port",
+        "8082"
+      ],
+      "cwd": "${workspaceFolder}/mitmproxy-addon",
+      "console": "integratedTerminal",
+      "env": {
+        "SENTINEL_GATEWAY_URL": "http://localhost:8080/api/inspect"
+      }
+    },
+    {
+      "name": "4. Demo Traffic Simulation",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/demo/run_simulation.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "5. React Dashboard (Browser Debugger)",
+      "type": "chrome",
+      "request": "launch",
+      "url": "http://localhost:3000",
+      "webRoot": "${workspaceFolder}/dashboard"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "🚀 Full Sentinel-JVM Stack (Gateway + ML + Proxy)",
+      "configurations": [
+        "1. Spring Boot Gateway (Java 21)",
+        "2. Python FastAPI ML Microservice",
+        "3. mitmproxy Interceptor Addon"
+      ],
+      "stopAll": true
+    }
+  ]
+}

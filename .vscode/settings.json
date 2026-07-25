@@ -1,0 +1,14 @@
+{
+  "java.configuration.updateBuildConfiguration": "automatic",
+  "java.compile.nullAnalysis.mode": "automatic",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/ml-service",
+    "${workspaceFolder}/mitmproxy-addon"
+  ],
+  "files.associations": {
+    "*.yml": "yaml",
+    "*.json": "jsonc"
+  },
+  "java.launchConfig.shortenCommandLine": "jarmanifest",
+  "python-envs.defaultEnvManager": "ms-python.python:system"
+}

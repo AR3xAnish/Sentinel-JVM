@@ -1,0 +1,35 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: sentinel-gateway
+  threads:
+    virtual:
+      enabled: true
+  data:
+    mongodb:
+      uri: ${SPRING_DATA_MONGODB_URI:mongodb+srv://anishsnilajkar_db_user:pubg1234@cluster0.tkv4bqk.mongodb.net/sentinel_db?retryWrites=true&w=majority}
+      auto-index-creation: true
+
+sentinel:
+  ml-service:
+    url: ${ML_SERVICE_URL:http://localhost:5000}
+    enabled: true
+  alerting:
+    webhook-url: ${ALERT_WEBHOOK_URL:http://localhost:8080/api/alerts/webhook-mock}
+    email-enabled: false
+    recipient-email: security-alerts@enterprise.com
+  proxy:
+    monitored-domains:
+      - api.openai.com
+      - chatgpt.com
+      - api.anthropic.com
+      - claude.ai
+      - api.perplexity.ai
+      - huggingface.co
+
+logging:
+  level:
+    root: INFO
+    com.sentinel.gateway: DEBUG

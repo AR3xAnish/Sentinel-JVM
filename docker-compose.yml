@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:6.0
+    container_name: sentinel-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: sentinel_db
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - sentinel-net
+
+  ml-service:
+    build:
+      context: ./ml-service
+      dockerfile: Dockerfile
+    container_name: sentinel-ml-service
+    ports:
+      - "5000:5000"
+    networks:
+      - sentinel-net
+
+  inspection-service:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: sentinel-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_DATA_MONGODB_URI=mongodb+srv://anishsnilajkar_db_user:pubg1234@cluster0.tkv4bqk.mongodb.net/sentinel_db?retryWrites=true&w=majority
+      - ML_SERVICE_URL=http://ml-service:5000
+    depends_on:
+      - mongodb
+      - ml-service
+    networks:
+      - sentinel-net
+
+  mitmproxy:
+    build:
+      context: ./mitmproxy-addon
+      dockerfile: Dockerfile
+    container_name: sentinel-mitmproxy
+    ports:
+      - "8082:8080"
+    environment:
+      - SENTINEL_GATEWAY_URL=http://inspection-service:8080/api/inspect
+    depends_on:
+      - inspection-service
+    networks:
+      - sentinel-net
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: sentinel-dashboard
+    ports:
+      - "3000:80"
+    depends_on:
+      - inspection-service
+    networks:
+      - sentinel-net
+
+networks:
+  sentinel-net:
+    driver: bridge
+
+volumes:
+  mongo-data:
