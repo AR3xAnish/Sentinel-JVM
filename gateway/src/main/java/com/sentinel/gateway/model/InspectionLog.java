@@ -31,6 +31,8 @@ public class InspectionLog {
     private String blockReason;
     private Integer originalPayloadSize;
     private Integer redactedPayloadSize;
+    private String body;
+    private String redactedBody;
     private Long executionTimeMs;
     private Double anomalyScore;
 }

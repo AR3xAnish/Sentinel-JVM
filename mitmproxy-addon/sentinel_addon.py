@@ -41,11 +41,21 @@ class SentinelMitmAddon:
         if "api/inspect" in flow.request.path or "8080" in str(flow.request.port):
             return
 
+        # Skip background browser telemetry, Datadog RUM, ping, and heartbeat requests
+        ignored_path_keywords = [
+            "/rum", "/ces/", "/ping", "/heartbeat", "/telemetry", "/statsc/",
+            "/OneCollector/", "/threshold/", "/metrics", "/analytics", "/logging"
+        ]
+        if any(kw in flow.request.path for kw in ignored_path_keywords):
+            return
+
         body_content = flow.request.text or ""
 
         # Ignore empty payloads
         if not body_content.strip():
             return
+
+        logger.info(f"[PATH CHECK] {host} {flow.request.path} | Length: {len(body_content)} | Content Snippet: {body_content[:150]}")
 
         client_ip = flow.client_conn.peername[0] if flow.client_conn.peername else "127.0.0.1"
 

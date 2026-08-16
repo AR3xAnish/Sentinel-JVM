@@ -86,7 +86,9 @@ def run_simulation():
 
         try:
             start_time = time.time()
-            res = requests.post(GATEWAY_URL, json=payload, timeout=5)
+            session = requests.Session()
+            session.trust_env = False
+            res = session.post(GATEWAY_URL, json=payload, timeout=5)
             elapsed_ms = round((time.time() - start_time) * 1000, 2)
 
             if res.status_code == 200:

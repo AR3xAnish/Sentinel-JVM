@@ -78,6 +78,8 @@ public class InspectionController {
                             .blockReason(eval.getReason())
                             .originalPayloadSize(payloadSize)
                             .redactedPayloadSize(sanitizedBody.length())
+                            .body(body)
+                            .redactedBody(eval.getAction() == Action.REDACT ? secretResult.getSanitizedBody() : null)
                             .executionTimeMs(executionTime)
                             .anomalyScore(anomalyScore)
                             .build();
