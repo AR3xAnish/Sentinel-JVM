@@ -6,18 +6,19 @@ import com.sentinel.gateway.model.RiskTier;
 import com.sentinel.gateway.model.StatsResponse;
 import com.sentinel.gateway.repository.InspectionLogRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
-import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.stream.Collectors;
 
+@Slf4j
 @RestController
 @RequestMapping("/api")
 @RequiredArgsConstructor
@@ -35,25 +36,29 @@ public class DashboardController {
 
         Pageable pageable = PageRequest.of(page, limit);
 
+        Flux<InspectionLog> flux;
         if (riskTier != null && !riskTier.isBlank()) {
             try {
                 RiskTier tier = RiskTier.valueOf(riskTier.toUpperCase());
-                return inspectionLogRepository.findByRiskTierOrderByTimestampDesc(tier, pageable);
+                flux = inspectionLogRepository.findByRiskTierOrderByTimestampDesc(tier, pageable);
             } catch (IllegalArgumentException e) {
-                // Ignore invalid tier filter
+                flux = inspectionLogRepository.findByOrderByTimestampDesc(pageable);
             }
-        }
-
-        if (decision != null && !decision.isBlank()) {
+        } else if (decision != null && !decision.isBlank()) {
             try {
                 Action act = Action.valueOf(decision.toUpperCase());
-                return inspectionLogRepository.findByDecisionOrderByTimestampDesc(act, pageable);
+                flux = inspectionLogRepository.findByDecisionOrderByTimestampDesc(act, pageable);
             } catch (IllegalArgumentException e) {
-                // Ignore invalid decision filter
+                flux = inspectionLogRepository.findByOrderByTimestampDesc(pageable);
             }
+        } else {
+            flux = inspectionLogRepository.findByOrderByTimestampDesc(pageable);
         }
 
-        return inspectionLogRepository.findByOrderByTimestampDesc(pageable);
+        return flux.onErrorResume(e -> {
+            log.warn("Error retrieving events from MongoDB: {}. Returning empty stream.", e.getMessage());
+            return Flux.empty();
+        });
     }
 
     @GetMapping("/stats")
@@ -61,13 +66,13 @@ public class DashboardController {
         return inspectionLogRepository.findAll()
                 .collectList()
                 .map(logs -> {
-                    if (logs.isEmpty()) {
+                    if (logs == null || logs.isEmpty()) {
                         return createEmptyStats();
                     }
 
                     long total = logs.size();
                     long allowed = logs.stream().filter(l -> l.getDecision() == Action.ALLOW).count();
-                    long redacted = logs.stream().filter(l -> l.getDecision() == Action.REDACT).count();
+                    long redacted = logs.stream().filter(l -> l.getDecision() == Action.REDACT || l.getDecision() == Action.MASK).count();
                     long blocked = logs.stream().filter(l -> l.getDecision() == Action.BLOCK).count();
                     long highRisk = logs.stream().filter(l -> l.getRiskTier() == RiskTier.HIGH || l.getRiskTier() == RiskTier.CRITICAL).count();
 
@@ -76,10 +81,19 @@ public class DashboardController {
                             .average().orElse(0.0);
 
                     Map<String, Long> riskDist = logs.stream()
-                            .collect(Collectors.groupingBy(l -> l.getRiskTier().name(), Collectors.counting()));
+                            .collect(Collectors.groupingBy(l -> l.getRiskTier() != null ? l.getRiskTier().name() : "LOW", Collectors.counting()));
 
                     Map<String, Long> topDomains = logs.stream()
                             .collect(Collectors.groupingBy(l -> l.getDestinationHost() != null ? l.getDestinationHost() : "unknown", Collectors.counting()));
+
+                    Map<String, Long> categoryMap = new HashMap<>();
+                    logs.forEach(l -> {
+                        if (l.getDetectedCategories() != null) {
+                            for (String cat : l.getDetectedCategories()) {
+                                categoryMap.put(cat, categoryMap.getOrDefault(cat, 0L) + 1);
+                            }
+                        }
+                    });
 
                     // Time series points grouped by hour
                     DateTimeFormatter formatter = DateTimeFormatter.ofPattern("HH:mm").withZone(ZoneId.systemDefault());
@@ -89,7 +103,7 @@ public class DashboardController {
                     List<StatsResponse.TimeSeriesPoint> trends = new ArrayList<>();
                     groupedByTime.forEach((timeStr, list) -> {
                         long tAllow = list.stream().filter(l -> l.getDecision() == Action.ALLOW).count();
-                        long tRedact = list.stream().filter(l -> l.getDecision() == Action.REDACT).count();
+                        long tRedact = list.stream().filter(l -> l.getDecision() == Action.REDACT || l.getDecision() == Action.MASK).count();
                         long tBlock = list.stream().filter(l -> l.getDecision() == Action.BLOCK).count();
                         trends.add(StatsResponse.TimeSeriesPoint.builder()
                                 .timestamp(timeStr)
@@ -109,8 +123,13 @@ public class DashboardController {
                             .averageLatencyMs(avgLatency)
                             .riskTierDistribution(riskDist)
                             .topTargetDomains(topDomains)
+                            .topDetectedCategories(categoryMap)
                             .usageTrends(trends)
                             .build();
+                })
+                .onErrorResume(e -> {
+                    log.warn("Error calculating stats from MongoDB: {}. Returning empty stats fallback.", e.getMessage());
+                    return Mono.just(createEmptyStats());
                 });
     }
 
@@ -124,6 +143,7 @@ public class DashboardController {
                 .averageLatencyMs(0.0)
                 .riskTierDistribution(Map.of("LOW", 0L, "MEDIUM", 0L, "HIGH", 0L, "CRITICAL", 0L))
                 .topTargetDomains(Map.of())
+                .topDetectedCategories(Map.of())
                 .usageTrends(Collections.emptyList())
                 .build();
     }

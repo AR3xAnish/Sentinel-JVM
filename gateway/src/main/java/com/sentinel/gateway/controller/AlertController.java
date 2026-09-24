@@ -25,7 +25,11 @@ public class AlertController {
     public Flux<AlertDocument> getAlerts(
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int limit) {
-        return alertRepository.findByOrderByTimestampDesc(PageRequest.of(page, limit));
+        return alertRepository.findByOrderByTimestampDesc(PageRequest.of(page, limit))
+                .onErrorResume(e -> {
+                    log.warn("Error retrieving alerts from MongoDB: {}. Returning empty list.", e.getMessage());
+                    return Flux.empty();
+                });
     }
 
     @PostMapping("/webhook-mock")

@@ -4,14 +4,14 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from model_trainer import train_and_save_model, MODEL_PATH, SCALER_PATH
 
 app = FastAPI(
-    title="Sentinel-JVM ML Anomaly Detection Service",
-    description="IsolationForest microservice for Shadow AI behavioral anomaly scoring",
-    version="1.0.0"
+    title="Sentinel-JVM Content & Semantic Analysis Service",
+    description="Microservice for semantic content classification and anomaly scoring",
+    version="2.0.0"
 )
 
 # Global variables for model and scaler
@@ -24,7 +24,7 @@ def load_model_and_scaler():
         try:
             model = joblib.load(MODEL_PATH)
             scaler = joblib.load(SCALER_PATH)
-            print("[ML Service] Loaded pre-trained IsolationForest model and scaler.")
+            print("[ML Service] Loaded pre-trained model and scaler.")
         except Exception as e:
             print(f"[ML Service] Error loading saved model: {e}. Retraining now...")
             model, scaler = train_and_save_model()
@@ -43,10 +43,12 @@ class ScoreRequest(BaseModel):
     dayOfWeek: int = Field(0, ge=0, le=6, description="Day of week (0=Mon, 6=Sun)")
     frequencyPerMinute: int = Field(1, ge=0, description="Request frequency per minute")
     userHistoricalRisk: float = Field(0.1, ge=0.0, le=1.0, description="User historical risk score")
+    bodyText: Optional[str] = Field(None, description="Optional payload body text for semantic analysis")
 
 class ScoreResponse(BaseModel):
-    anomalyScore: float = Field(..., description="Normalized anomaly score between 0.0 and 1.0")
+    anomalyScore: float = Field(..., description="Normalized semantic & behavioral anomaly score between 0.0 and 1.0")
     isAnomaly: bool = Field(..., description="True if anomaly decision threshold is exceeded")
+    semanticCategory: Optional[str] = Field("GENERAL_QUERY", description="Detected semantic content category")
     details: Dict[str, Any]
 
 @app.get("/health")
@@ -59,7 +61,6 @@ def score_payload(req: ScoreRequest):
     if model is None or scaler is None:
         load_model_and_scaler()
 
-    # Prepare feature vector
     df = pd.DataFrame([{
         "payload_size": req.payloadSize,
         "hour_of_day": req.hourOfDay,
@@ -70,25 +71,34 @@ def score_payload(req: ScoreRequest):
 
     try:
         scaled_features = scaler.transform(df)
-        decision = float(model.decision_function(scaled_features)[0]) # > 0 is normal, < 0 is anomaly
-        prediction = int(model.predict(scaled_features)[0]) # -1 for anomaly, 1 for normal
+        decision = float(model.decision_function(scaled_features)[0])
+        prediction = int(model.predict(scaled_features)[0])
 
-        # Convert IsolationForest decision function (> 0 normal, < 0 anomaly) to 0.0 - 1.0 risk score
         if decision >= 0:
-            norm_anomaly_score = float(np.clip(0.30 - (decision * 1.2), 0.05, 0.35))
+            norm_anomaly_score = float(np.clip(0.10 - (decision * 0.5), 0.05, 0.25))
         else:
-            norm_anomaly_score = float(np.clip(0.35 + (abs(decision) * 2.2), 0.36, 1.0))
+            norm_anomaly_score = float(np.clip(0.25 + (abs(decision) * 1.5), 0.26, 0.90))
+
+        # Perform basic semantic classification on text if provided
+        body = req.bodyText or ""
+        semantic_cat = "GENERAL_QUERY"
+        if "CONFIDENTIAL" in body.upper() or "PROPRIETARY" in body.upper():
+            semantic_cat = "BUSINESS_CONFIDENTIAL"
+            norm_anomaly_score = max(norm_anomaly_score, 0.85)
+        elif "class " in body or "def " in body or "function " in body or "SELECT " in body:
+            semantic_cat = "SOURCE_CODE"
+            norm_anomaly_score = max(norm_anomaly_score, 0.70)
 
         is_anomaly = bool(prediction == -1 or norm_anomaly_score > 0.65)
 
         return ScoreResponse(
             anomalyScore=round(norm_anomaly_score, 4),
             isAnomaly=is_anomaly,
+            semanticCategory=semantic_cat,
             details={
-                "decision_function_score": round(decision, 4),
-                "is_isolation_outlier": bool(prediction == -1),
+                "model_decision_score": round(decision, 4),
+                "is_outlier": bool(prediction == -1),
                 "payload_size": int(req.payloadSize),
-                "hour_of_day": int(req.hourOfDay),
                 "destination": str(req.destinationHost)
             }
         )
@@ -99,7 +109,7 @@ def score_payload(req: ScoreRequest):
 def train_model_endpoint():
     global model, scaler
     model, scaler = train_and_save_model()
-    return {"status": "success", "message": "IsolationForest model retrained successfully"}
+    return {"status": "success", "message": "Content classification model retrained successfully"}
 
 if __name__ == "__main__":
     import uvicorn

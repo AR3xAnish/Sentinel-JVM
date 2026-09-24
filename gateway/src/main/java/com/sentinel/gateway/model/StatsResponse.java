@@ -21,6 +21,7 @@ public class StatsResponse {
     private double averageLatencyMs;
     private Map<String, Long> riskTierDistribution;
     private Map<String, Long> topTargetDomains;
+    private Map<String, Long> topDetectedCategories;
     private List<TimeSeriesPoint> usageTrends;
 
     @Data

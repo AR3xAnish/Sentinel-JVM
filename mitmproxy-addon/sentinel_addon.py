@@ -15,7 +15,10 @@ MONITORED_DOMAINS = [
     "chatgpt.com",
     "api.anthropic.com",
     "claude.ai",
+    "gemini.google.com",
+    "generativelanguage.googleapis.com",
     "api.perplexity.ai",
+    "perplexity.ai",
     "huggingface.co",
     "localhost",
     "127.0.0.1"
@@ -82,10 +85,10 @@ class SentinelMitmAddon:
                 result = response.json()
                 decision = result.get("decision", "ALLOW")
                 risk_tier = result.get("riskTier", "LOW")
-                block_reason = result.get("blockReason", "Policy Violation")
+                block_reason = result.get("reason") or result.get("blockReason") or "Policy Violation"
                 redacted_body = result.get("redactedBody")
 
-                logger.info(f"[{host}] Decision: {decision} | Risk Tier: {risk_tier} | Latency: {elapsed_ms}ms")
+                logger.info(f"[{host}] Decision: {decision} | Risk Tier: {risk_tier} | Latency: {elapsed_ms}ms | Reason: {block_reason}")
 
                 # Add inspection metadata headers (lowercased for HTTP/2 compliance)
                 flow.request.headers["x-sentinel-inspected"] = "true"
