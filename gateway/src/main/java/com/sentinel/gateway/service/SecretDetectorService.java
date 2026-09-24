@@ -1,5 +1,10 @@
 package com.sentinel.gateway.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.node.TextNode;
 import com.sentinel.gateway.model.ContentAnalysisResult;
 import com.sentinel.gateway.model.DetectionCategory;
 import com.sentinel.gateway.model.FindingDetail;
@@ -10,16 +15,17 @@ import lombok.NoArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @Slf4j
 @Service
 public class SecretDetectorService {
+
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper()
+            .enable(com.fasterxml.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
 
     // 1. CREDENTIALS AND SECRETS PATTERNS
     private static final Pattern AWS_KEY_PATTERN = Pattern.compile("(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}");
@@ -34,7 +40,8 @@ public class SecretDetectorService {
 
     // 2. PERSONAL DATA (PII) PATTERNS
     private static final Pattern EMAIL_PATTERN = Pattern.compile("\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b");
-    private static final Pattern PHONE_PATTERN = Pattern.compile("(?:\\+|\\b)(?:\\d{1,3}[-.\\s]?)?\\(?\\d{3}\\)?[-.\\s]?\\d{3,4}(?:[-.\\s]?\\d{4})?\\b");
+    // Formatted telephone pattern requiring delimiters or international '+' prefix to prevent false matching on timestamps
+    private static final Pattern PHONE_PATTERN = Pattern.compile("(?:\\+\\d{1,3}[-.\\s]?)?\\(?\\d{3}\\)?[-.\\s]\\d{3,4}(?:[-.\\s]\\d{4})?\\b|\\+\\d{1,3}[-.\\s]?\\d{6,14}\\b");
     private static final Pattern SSN_GOVT_ID_PATTERN = Pattern.compile("\\b\\d{3}-\\d{2}-\\d{4}\\b");
     private static final Pattern EMP_CUST_ID_PATTERN = Pattern.compile("\\b(?:EMP|CUST|USR|CUSTOMER|EMP_ID)-\\d{4,8}\\b", Pattern.CASE_INSENSITIVE);
 
@@ -58,6 +65,15 @@ public class SecretDetectorService {
     // 7. LEGAL DATA PATTERNS
     private static final Pattern LEGAL_DOC_PATTERN = Pattern.compile("\\b(?:NON-DISCLOSURE AGREEMENT|MUTUAL NDA|ATTORNEY-CLIENT PRIVILEGED|MASTER SERVICES AGREEMENT|LITIGATION HOLD|SETTLEMENT AGREEMENT)\\b", Pattern.CASE_INSENSITIVE);
 
+    // Protocol metadata fields that MUST NEVER be inspected or modified
+    private static final Set<String> PROTOCOL_METADATA_FIELDS = Set.of(
+            "create_time", "created_at", "created", "timestamp", "time", "date",
+            "conversation_id", "parent_message_id", "id", "message_id", "req_id", "request_id",
+            "model", "action", "role", "type", "author", "timezone_offset_min", "timezone",
+            "history_and_training_disabled", "system_hints", "client_contextual_info",
+            "serialization_metadata", "metadata", "status", "code", "index", "content_type"
+    );
+
     @Data
     @Builder
     @NoArgsConstructor
@@ -68,6 +84,52 @@ public class SecretDetectorService {
         private boolean redactionOccurred;
         private String sanitizedBody;
         private List<String> detectedPatterns;
+    }
+
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class TextDlpResult {
+        private String sanitizedText;
+        private boolean modified;
+        @Builder.Default
+        private Set<DetectionCategory> categories = new HashSet<>();
+        @Builder.Default
+        private List<FindingDetail> findings = new ArrayList<>();
+        @Builder.Default
+        private Set<String> secretTypes = new HashSet<>();
+        private int piiCount;
+        private int financialCount;
+        private double sourceCodeScore;
+        private double confidentialScore;
+        private double hrScore;
+        private double legalScore;
+    }
+
+    private static class TextDlpAccumulator {
+        final Set<DetectionCategory> categories = new HashSet<>();
+        final List<FindingDetail> findings = new ArrayList<>();
+        final Set<String> secretTypes = new HashSet<>();
+        int piiCount = 0;
+        int financialCount = 0;
+        double sourceCodeScore = 0.0;
+        double confidentialScore = 0.0;
+        double hrScore = 0.0;
+        double legalScore = 0.0;
+
+        void merge(TextDlpResult result) {
+            if (result == null) return;
+            if (result.getCategories() != null) categories.addAll(result.getCategories());
+            if (result.getFindings() != null) findings.addAll(result.getFindings());
+            if (result.getSecretTypes() != null) secretTypes.addAll(result.getSecretTypes());
+            piiCount += result.getPiiCount();
+            financialCount += result.getFinancialCount();
+            sourceCodeScore = Math.max(sourceCodeScore, result.getSourceCodeScore());
+            confidentialScore = Math.max(confidentialScore, result.getConfidentialScore());
+            hrScore = Math.max(hrScore, result.getHrScore());
+            legalScore = Math.max(legalScore, result.getLegalScore());
+        }
     }
 
     public DetectionResult inspectBody(String body) {
@@ -103,10 +165,300 @@ public class SecretDetectorService {
                     .build();
         }
 
+        String trimmed = body.trim();
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            try {
+                JsonNode rootNode = OBJECT_MAPPER.readTree(body);
+                if (rootNode != null && (rootNode.isObject() || rootNode.isArray())) {
+                    return analyzeJsonPayload(rootNode, body, host);
+                }
+            } catch (Exception e) {
+                log.debug("Payload is not valid JSON, analyzing as raw text: {}", e.getMessage());
+            }
+        }
+
+        // Fallback for raw text payloads (e.g. unit test string prompts)
+        TextDlpResult textResult = scanAndRedactText(body);
+        return ContentAnalysisResult.builder()
+                .rawBody(body)
+                .sanitizedBody(textResult.getSanitizedText())
+                .destinationHost(host)
+                .detectedCategories(textResult.getCategories())
+                .findings(textResult.getFindings())
+                .secretTypes(textResult.getSecretTypes())
+                .piiCount(textResult.getPiiCount())
+                .financialDataIndicators(textResult.getFinancialCount())
+                .sourceCodeConfidence(textResult.getSourceCodeScore())
+                .businessConfidentialConfidence(textResult.getConfidentialScore())
+                .hrDataIndicators(textResult.getHrScore())
+                .legalDataIndicators(textResult.getLegalScore())
+                .build();
+    }
+
+    private ContentAnalysisResult analyzeJsonPayload(JsonNode rootNode, String originalBody, String host) {
+        AtomicBoolean modified = new AtomicBoolean(false);
+        TextDlpAccumulator accumulator = new TextDlpAccumulator();
+        boolean targetedExtractionFound = false;
+
+        // 1. ChatGPT Web and OpenAI API: inspect messages[].content (and parts[])
+        if (rootNode.has("messages") && rootNode.get("messages").isArray()) {
+            ArrayNode messagesArray = (ArrayNode) rootNode.get("messages");
+            for (JsonNode messageNode : messagesArray) {
+                if (messageNode.isObject()) {
+                    ObjectNode msgObj = (ObjectNode) messageNode;
+                    if (msgObj.has("content")) {
+                        JsonNode contentNode = msgObj.get("content");
+
+                        // 1a. ChatGPT Web backend: content is an object with "parts" array of text strings
+                        if (contentNode.isObject() && contentNode.has("parts") && contentNode.get("parts").isArray()) {
+                            ArrayNode partsArray = (ArrayNode) contentNode.get("parts");
+                            for (int i = 0; i < partsArray.size(); i++) {
+                                JsonNode partNode = partsArray.get(i);
+                                if (partNode.isTextual()) {
+                                    targetedExtractionFound = true;
+                                    String text = partNode.asText();
+                                    TextDlpResult result = scanAndRedactText(text);
+                                    accumulator.merge(result);
+                                    if (result.isModified()) {
+                                        partsArray.set(i, new TextNode(result.getSanitizedText()));
+                                        modified.set(true);
+                                    }
+                                } else if (partNode.isObject() && partNode.has("text") && partNode.get("text").isTextual()) {
+                                    targetedExtractionFound = true;
+                                    String text = partNode.get("text").asText();
+                                    TextDlpResult result = scanAndRedactText(text);
+                                    accumulator.merge(result);
+                                    if (result.isModified()) {
+                                        ((ObjectNode) partNode).put("text", result.getSanitizedText());
+                                        modified.set(true);
+                                    }
+                                }
+                            }
+                        }
+                        // 1b. OpenAI / Claude API: content is a direct text string
+                        else if (contentNode.isTextual()) {
+                            targetedExtractionFound = true;
+                            String text = contentNode.asText();
+                            TextDlpResult result = scanAndRedactText(text);
+                            accumulator.merge(result);
+                            if (result.isModified()) {
+                                msgObj.put("content", result.getSanitizedText());
+                                modified.set(true);
+                            }
+                        }
+                        // 1c. Multimodal parts array: content is an array of objects
+                        else if (contentNode.isArray()) {
+                            ArrayNode contentArray = (ArrayNode) contentNode;
+                            for (int i = 0; i < contentArray.size(); i++) {
+                                JsonNode itemNode = contentArray.get(i);
+                                if (itemNode.isTextual()) {
+                                    targetedExtractionFound = true;
+                                    String text = itemNode.asText();
+                                    TextDlpResult result = scanAndRedactText(text);
+                                    accumulator.merge(result);
+                                    if (result.isModified()) {
+                                        contentArray.set(i, new TextNode(result.getSanitizedText()));
+                                        modified.set(true);
+                                    }
+                                } else if (itemNode.isObject() && itemNode.has("text") && itemNode.get("text").isTextual()) {
+                                    targetedExtractionFound = true;
+                                    String text = itemNode.get("text").asText();
+                                    TextDlpResult result = scanAndRedactText(text);
+                                    accumulator.merge(result);
+                                    if (result.isModified()) {
+                                        ((ObjectNode) itemNode).put("text", result.getSanitizedText());
+                                        modified.set(true);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Google Gemini API: inspect contents[].parts[].text
+        if (rootNode.has("contents") && rootNode.get("contents").isArray()) {
+            ArrayNode contentsArray = (ArrayNode) rootNode.get("contents");
+            for (JsonNode contentItem : contentsArray) {
+                if (contentItem.isObject() && contentItem.has("parts") && contentItem.get("parts").isArray()) {
+                    ArrayNode partsArray = (ArrayNode) contentItem.get("parts");
+                    for (int i = 0; i < partsArray.size(); i++) {
+                        JsonNode partNode = partsArray.get(i);
+                        if (partNode.isObject() && partNode.has("text") && partNode.get("text").isTextual()) {
+                            targetedExtractionFound = true;
+                            String text = partNode.get("text").asText();
+                            TextDlpResult result = scanAndRedactText(text);
+                            accumulator.merge(result);
+                            if (result.isModified()) {
+                                ((ObjectNode) partNode).put("text", result.getSanitizedText());
+                                modified.set(true);
+                            }
+                        } else if (partNode.isTextual()) {
+                            targetedExtractionFound = true;
+                            String text = partNode.asText();
+                            TextDlpResult result = scanAndRedactText(text);
+                            accumulator.merge(result);
+                            if (result.isModified()) {
+                                partsArray.set(i, new TextNode(result.getSanitizedText()));
+                                modified.set(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Top-level prompt/query fields
+        if (rootNode.isObject()) {
+            ObjectNode objNode = (ObjectNode) rootNode;
+            String[] promptFields = {"prompt", "query", "input", "message", "text"};
+            for (String field : promptFields) {
+                if (objNode.has(field) && objNode.get(field).isTextual()) {
+                    targetedExtractionFound = true;
+                    String text = objNode.get(field).asText();
+                    TextDlpResult result = scanAndRedactText(text);
+                    accumulator.merge(result);
+                    if (result.isModified()) {
+                        objNode.put(field, result.getSanitizedText());
+                        modified.set(true);
+                    }
+                }
+            }
+        }
+
+        // 4. Safe fallback for arbitrary JSON structures (e.g. config payloads)
+        if (!targetedExtractionFound) {
+            inspectGenericJsonValues(rootNode, accumulator, modified);
+        }
+
+        // 5. Serialize sanitized JSON and validate integrity
+        String sanitizedBody = originalBody;
+        boolean isValidJson = true;
+        if (modified.get()) {
+            try {
+                sanitizedBody = OBJECT_MAPPER.writeValueAsString(rootNode);
+                // Strict validation: verify that output parses as valid JSON
+                OBJECT_MAPPER.readTree(sanitizedBody);
+            } catch (Exception e) {
+                log.error("CRITICAL: Failed to validate sanitized JSON! Falling back to original body to prevent downstream failure.", e);
+                sanitizedBody = originalBody;
+                isValidJson = false;
+            }
+        }
+
+        // 6. Defensive logging in dev mode (NEVER log secrets, credentials, or full payload bodies)
+        log.info("DLP Inspection Complete for destination '{}' | Modified: {} | Valid JSON: {} | Detections: {} | Categories: {}",
+                host,
+                modified.get(),
+                isValidJson,
+                accumulator.findings.size(),
+                accumulator.categories.stream().map(DetectionCategory::name).toList());
+
+        return ContentAnalysisResult.builder()
+                .rawBody(originalBody)
+                .sanitizedBody(sanitizedBody)
+                .destinationHost(host)
+                .detectedCategories(accumulator.categories)
+                .findings(accumulator.findings)
+                .secretTypes(accumulator.secretTypes)
+                .piiCount(accumulator.piiCount)
+                .financialDataIndicators(accumulator.financialCount)
+                .sourceCodeConfidence(accumulator.sourceCodeScore)
+                .businessConfidentialConfidence(accumulator.confidentialScore)
+                .hrDataIndicators(accumulator.hrScore)
+                .legalDataIndicators(accumulator.legalScore)
+                .build();
+    }
+
+    private void inspectGenericJsonValues(JsonNode node, TextDlpAccumulator accumulator, AtomicBoolean modified) {
+        if (node.isObject()) {
+            ObjectNode obj = (ObjectNode) node;
+            Iterator<Map.Entry<String, JsonNode>> fields = obj.fields();
+            List<String> keysToUpdate = new ArrayList<>();
+            Map<String, String> updates = new HashMap<>();
+
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> entry = fields.next();
+                String key = entry.getKey().toLowerCase();
+                JsonNode child = entry.getValue();
+
+                // Strictly skip protocol metadata fields, numeric fields, booleans, and nulls
+                if (PROTOCOL_METADATA_FIELDS.contains(key) || child.isNumber() || child.isBoolean() || child.isNull()) {
+                    continue;
+                }
+
+                if (child.isTextual()) {
+                    String text = child.asText();
+                    if (isSecretFieldKey(key)) {
+                        accumulator.categories.add(DetectionCategory.CREDENTIALS_AND_SECRETS);
+                        accumulator.secretTypes.add("PASSWORD");
+                        accumulator.findings.add(FindingDetail.builder()
+                                .category(DetectionCategory.CREDENTIALS_AND_SECRETS)
+                                .findingType("PASSWORD")
+                                .maskedSnippet("password=***")
+                                .confidence(0.95)
+                                .count(1)
+                                .build());
+                        updates.put(entry.getKey(), "[REDACTED_PASSWORD]");
+                        keysToUpdate.add(entry.getKey());
+                    } else {
+                        TextDlpResult result = scanAndRedactText(text);
+                        accumulator.merge(result);
+                        if (result.isModified()) {
+                            updates.put(entry.getKey(), result.getSanitizedText());
+                            keysToUpdate.add(entry.getKey());
+                        }
+                    }
+                } else if (child.isObject() || child.isArray()) {
+                    inspectGenericJsonValues(child, accumulator, modified);
+                }
+            }
+
+            for (String k : keysToUpdate) {
+                obj.put(k, updates.get(k));
+                modified.set(true);
+            }
+        } else if (node.isArray()) {
+            ArrayNode arr = (ArrayNode) node;
+            for (int i = 0; i < arr.size(); i++) {
+                JsonNode child = arr.get(i);
+                if (child.isTextual()) {
+                    String text = child.asText();
+                    TextDlpResult result = scanAndRedactText(text);
+                    accumulator.merge(result);
+                    if (result.isModified()) {
+                        arr.set(i, new TextNode(result.getSanitizedText()));
+                        modified.set(true);
+                    }
+                } else if (child.isObject() || child.isArray()) {
+                    inspectGenericJsonValues(child, accumulator, modified);
+                }
+            }
+        }
+    }
+
+    private boolean isSecretFieldKey(String key) {
+        String lower = key.toLowerCase();
+        return lower.equals("password") || lower.equals("passwd") || lower.equals("pass")
+                || lower.equals("secret") || lower.equals("client_secret") || lower.equals("dbpassword");
+    }
+
+    public TextDlpResult scanAndRedactText(String text) {
+        if (text == null || text.isBlank()) {
+            return TextDlpResult.builder()
+                    .sanitizedText(text)
+                    .modified(false)
+                    .categories(new HashSet<>())
+                    .findings(new ArrayList<>())
+                    .secretTypes(new HashSet<>())
+                    .build();
+        }
+
         Set<DetectionCategory> categories = new HashSet<>();
         List<FindingDetail> findings = new ArrayList<>();
         Set<String> secretTypes = new HashSet<>();
-        String currentBody = body;
+        String currentText = text;
 
         int piiCount = 0;
         int financialCount = 0;
@@ -116,7 +468,7 @@ public class SecretDetectorService {
         double legalScore = 0.0;
 
         // --- 1. CREDENTIALS AND SECRETS ---
-        Matcher awsMatcher = AWS_KEY_PATTERN.matcher(currentBody);
+        Matcher awsMatcher = AWS_KEY_PATTERN.matcher(currentText);
         if (awsMatcher.find()) {
             categories.add(DetectionCategory.CREDENTIALS_AND_SECRETS);
             secretTypes.add("AWS_ACCESS_KEY");
@@ -127,10 +479,10 @@ public class SecretDetectorService {
                     .confidence(1.0)
                     .count(1)
                     .build());
-            currentBody = awsMatcher.replaceAll("[REDACTED_AWS_KEY]");
+            currentText = awsMatcher.replaceAll("[REDACTED_AWS_KEY]");
         }
 
-        Matcher pemMatcher = PEM_PRIVATE_KEY_PATTERN.matcher(currentBody);
+        Matcher pemMatcher = PEM_PRIVATE_KEY_PATTERN.matcher(currentText);
         if (pemMatcher.find()) {
             categories.add(DetectionCategory.CREDENTIALS_AND_SECRETS);
             secretTypes.add("PEM_PRIVATE_KEY");
@@ -141,10 +493,10 @@ public class SecretDetectorService {
                     .confidence(1.0)
                     .count(1)
                     .build());
-            currentBody = pemMatcher.replaceAll("[REDACTED_PRIVATE_KEY]");
+            currentText = pemMatcher.replaceAll("[REDACTED_PRIVATE_KEY]");
         }
 
-        Matcher gcpMatcher = GCP_SERVICE_ACCOUNT_PATTERN.matcher(currentBody);
+        Matcher gcpMatcher = GCP_SERVICE_ACCOUNT_PATTERN.matcher(currentText);
         if (gcpMatcher.find()) {
             categories.add(DetectionCategory.CREDENTIALS_AND_SECRETS);
             secretTypes.add("GCP_SERVICE_ACCOUNT");
@@ -155,10 +507,10 @@ public class SecretDetectorService {
                     .confidence(1.0)
                     .count(1)
                     .build());
-            currentBody = gcpMatcher.replaceAll("[REDACTED_GCP_KEY]");
+            currentText = gcpMatcher.replaceAll("[REDACTED_GCP_KEY]");
         }
 
-        Matcher passMatcher = PASSWORD_JSON_PATTERN.matcher(currentBody);
+        Matcher passMatcher = PASSWORD_JSON_PATTERN.matcher(currentText);
         if (passMatcher.find()) {
             categories.add(DetectionCategory.CREDENTIALS_AND_SECRETS);
             secretTypes.add("PASSWORD");
@@ -169,10 +521,10 @@ public class SecretDetectorService {
                     .confidence(0.95)
                     .count(1)
                     .build());
-            currentBody = passMatcher.replaceAll("$1[REDACTED_PASSWORD]$3");
+            currentText = passMatcher.replaceAll("$1[REDACTED_PASSWORD]$3");
         }
 
-        Matcher bearerMatcher = BEARER_TOKEN_PATTERN.matcher(currentBody);
+        Matcher bearerMatcher = BEARER_TOKEN_PATTERN.matcher(currentText);
         if (bearerMatcher.find()) {
             categories.add(DetectionCategory.CREDENTIALS_AND_SECRETS);
             secretTypes.add("BEARER_TOKEN");
@@ -183,10 +535,10 @@ public class SecretDetectorService {
                     .confidence(0.95)
                     .count(1)
                     .build());
-            currentBody = bearerMatcher.replaceAll("$1[REDACTED_BEARER_TOKEN]");
+            currentText = bearerMatcher.replaceAll("$1[REDACTED_BEARER_TOKEN]");
         }
 
-        Matcher apiKeyMatcher = API_KEY_FIELD_PATTERN.matcher(currentBody);
+        Matcher apiKeyMatcher = API_KEY_FIELD_PATTERN.matcher(currentText);
         if (apiKeyMatcher.find()) {
             categories.add(DetectionCategory.CREDENTIALS_AND_SECRETS);
             secretTypes.add("API_KEY");
@@ -197,10 +549,24 @@ public class SecretDetectorService {
                     .confidence(0.90)
                     .count(1)
                     .build());
-            currentBody = apiKeyMatcher.replaceAll("$1[REDACTED_API_KEY]$3");
+            currentText = apiKeyMatcher.replaceAll("$1[REDACTED_API_KEY]$3");
         }
 
-        Matcher jwtMatcher = JWT_PATTERN.matcher(currentBody);
+        Matcher genericKeyMatcher = GENERIC_API_KEY_KV_PATTERN.matcher(currentText);
+        if (genericKeyMatcher.find()) {
+            categories.add(DetectionCategory.CREDENTIALS_AND_SECRETS);
+            secretTypes.add("GENERIC_API_KEY");
+            findings.add(FindingDetail.builder()
+                    .category(DetectionCategory.CREDENTIALS_AND_SECRETS)
+                    .findingType("GENERIC_API_KEY")
+                    .maskedSnippet("api_key=***")
+                    .confidence(0.85)
+                    .count(1)
+                    .build());
+            currentText = genericKeyMatcher.replaceAll("$1[REDACTED_API_KEY]");
+        }
+
+        Matcher jwtMatcher = JWT_PATTERN.matcher(currentText);
         if (jwtMatcher.find()) {
             categories.add(DetectionCategory.CREDENTIALS_AND_SECRETS);
             secretTypes.add("JWT_TOKEN");
@@ -211,10 +577,10 @@ public class SecretDetectorService {
                     .confidence(0.95)
                     .count(1)
                     .build());
-            currentBody = jwtMatcher.replaceAll("[REDACTED_JWT_TOKEN]");
+            currentText = jwtMatcher.replaceAll("[REDACTED_JWT_TOKEN]");
         }
 
-        Matcher dbMatcher = DB_CONN_STRING_PATTERN.matcher(currentBody);
+        Matcher dbMatcher = DB_CONN_STRING_PATTERN.matcher(currentText);
         if (dbMatcher.find()) {
             categories.add(DetectionCategory.CREDENTIALS_AND_SECRETS);
             secretTypes.add("DB_CREDENTIALS");
@@ -225,67 +591,66 @@ public class SecretDetectorService {
                     .confidence(0.95)
                     .count(1)
                     .build());
-            currentBody = dbMatcher.replaceAll("[REDACTED_DB_CONNECTION_STRING]");
+            currentText = dbMatcher.replaceAll("[REDACTED_DB_CONNECTION_STRING]");
         }
 
         // --- 2. FINANCIAL DATA (Run BEFORE PII) ---
-        Matcher ccMatcher = CREDIT_CARD_PATTERN.matcher(currentBody);
+        Matcher ccMatcher = CREDIT_CARD_PATTERN.matcher(currentText);
         StringBuffer ccSb = new StringBuffer();
         int ccCount = 0;
         while (ccMatcher.find()) {
-            String candidate = ccMatcher.group();
-            if (isLuhnValid(candidate)) {
-                ccMatcher.appendReplacement(ccSb, "[REDACTED_CREDIT_CARD]");
+            String match = ccMatcher.group();
+            if (isLuhnValid(match)) {
                 ccCount++;
+                ccMatcher.appendReplacement(ccSb, "[REDACTED_CREDIT_CARD]");
             } else {
-                ccMatcher.appendReplacement(ccSb, Matcher.quoteReplacement(candidate));
+                ccMatcher.appendReplacement(ccSb, Matcher.quoteReplacement(match));
             }
         }
         ccMatcher.appendTail(ccSb);
-
+        currentText = ccSb.toString();
         if (ccCount > 0) {
             categories.add(DetectionCategory.FINANCIAL_DATA);
             financialCount += ccCount;
             findings.add(FindingDetail.builder()
                     .category(DetectionCategory.FINANCIAL_DATA)
-                    .findingType("CREDIT_CARD")
-                    .maskedSnippet("****-****-****-****")
+                    .findingType("CREDIT_CARD_NUMBER")
+                    .maskedSnippet("[REDACTED_CREDIT_CARD]")
                     .confidence(1.0)
                     .count(ccCount)
                     .build());
-            currentBody = ccSb.toString();
         }
 
-        Matcher ibanMatcher = IBAN_BANK_PATTERN.matcher(currentBody);
+        Matcher ibanMatcher = IBAN_BANK_PATTERN.matcher(currentText);
         if (ibanMatcher.find()) {
             categories.add(DetectionCategory.FINANCIAL_DATA);
             financialCount++;
             findings.add(FindingDetail.builder()
                     .category(DetectionCategory.FINANCIAL_DATA)
-                    .findingType("BANK_ACCOUNT_IBAN")
-                    .maskedSnippet("IBAN-****")
+                    .findingType("IBAN_BANK_ACCOUNT")
+                    .maskedSnippet("[REDACTED_IBAN]")
                     .confidence(0.90)
                     .count(1)
                     .build());
-            currentBody = ibanMatcher.replaceAll("[REDACTED_BANK_ACCOUNT]");
+            currentText = ibanMatcher.replaceAll("[REDACTED_IBAN]");
         }
 
-        Matcher salaryMatcher = SALARY_PAYROLL_PATTERN.matcher(currentBody);
+        Matcher salaryMatcher = SALARY_PAYROLL_PATTERN.matcher(currentText);
         if (salaryMatcher.find()) {
             categories.add(DetectionCategory.FINANCIAL_DATA);
             financialCount++;
             findings.add(FindingDetail.builder()
                     .category(DetectionCategory.FINANCIAL_DATA)
-                    .findingType("SALARY_PAYROLL")
-                    .maskedSnippet("salary=***")
+                    .findingType("COMPENSATION_SALARY")
+                    .maskedSnippet("salary=[REDACTED]")
                     .confidence(0.85)
                     .count(1)
                     .build());
-            currentBody = salaryMatcher.replaceAll("[REDACTED_SALARY_DATA]");
+            currentText = salaryMatcher.replaceAll("salary=[REDACTED_FINANCIAL_RECORD]");
         }
 
         // --- 3. PERSONAL DATA (PII) ---
-        Matcher emailMatcher = EMAIL_PATTERN.matcher(currentBody);
+        Matcher emailMatcher = EMAIL_PATTERN.matcher(currentText);
         int emailCount = 0;
         while (emailMatcher.find()) {
             emailCount++;
@@ -300,10 +665,10 @@ public class SecretDetectorService {
                     .confidence(0.95)
                     .count(emailCount)
                     .build());
-            currentBody = EMAIL_PATTERN.matcher(currentBody).replaceAll("[REDACTED_EMAIL]");
+            currentText = EMAIL_PATTERN.matcher(currentText).replaceAll("[REDACTED_EMAIL]");
         }
 
-        Matcher phoneMatcher = PHONE_PATTERN.matcher(currentBody);
+        Matcher phoneMatcher = PHONE_PATTERN.matcher(currentText);
         int phoneCount = 0;
         while (phoneMatcher.find()) {
             phoneCount++;
@@ -318,10 +683,10 @@ public class SecretDetectorService {
                     .confidence(0.85)
                     .count(phoneCount)
                     .build());
-            currentBody = PHONE_PATTERN.matcher(currentBody).replaceAll("[REDACTED_PHONE_NUMBER]");
+            currentText = PHONE_PATTERN.matcher(currentText).replaceAll("[REDACTED_PHONE_NUMBER]");
         }
 
-        Matcher ssnMatcher = SSN_GOVT_ID_PATTERN.matcher(currentBody);
+        Matcher ssnMatcher = SSN_GOVT_ID_PATTERN.matcher(currentText);
         if (ssnMatcher.find()) {
             categories.add(DetectionCategory.PERSONAL_DATA);
             piiCount++;
@@ -332,10 +697,10 @@ public class SecretDetectorService {
                     .confidence(0.90)
                     .count(1)
                     .build());
-            currentBody = SSN_GOVT_ID_PATTERN.matcher(currentBody).replaceAll("[REDACTED_GOVT_ID]");
+            currentText = SSN_GOVT_ID_PATTERN.matcher(currentText).replaceAll("[REDACTED_GOVT_ID]");
         }
 
-        Matcher empMatcher = EMP_CUST_ID_PATTERN.matcher(currentBody);
+        Matcher empMatcher = EMP_CUST_ID_PATTERN.matcher(currentText);
         if (empMatcher.find()) {
             categories.add(DetectionCategory.PERSONAL_DATA);
             piiCount++;
@@ -346,37 +711,34 @@ public class SecretDetectorService {
                     .confidence(0.85)
                     .count(1)
                     .build());
-            currentBody = EMP_CUST_ID_PATTERN.matcher(currentBody).replaceAll("[REDACTED_EMPLOYEE_ID]");
+            currentText = EMP_CUST_ID_PATTERN.matcher(currentText).replaceAll("[REDACTED_EMPLOYEE_ID]");
         }
 
         // --- 4. SOURCE CODE DETECTION ---
-        int javaMatches = countMatches(JAVA_CODE_PATTERN, body);
-        int pythonMatches = countMatches(PYTHON_CODE_PATTERN, body);
-        int jsMatches = countMatches(JS_TS_CODE_PATTERN, body);
-        int sqlMatches = countMatches(SQL_CODE_PATTERN, body);
+        int javaMatches = countMatches(JAVA_CODE_PATTERN, text);
+        int pythonMatches = countMatches(PYTHON_CODE_PATTERN, text);
+        int jsMatches = countMatches(JS_TS_CODE_PATTERN, text);
+        int sqlMatches = countMatches(SQL_CODE_PATTERN, text);
 
-        int totalCodeMatches = javaMatches + pythonMatches + jsMatches + sqlMatches;
-        int lineCount = body.split("\r\n|\r|\n").length;
-
-        if (totalCodeMatches >= 2 || (totalCodeMatches >= 1 && lineCount > 4)) {
-            sourceCodeScore = Math.min(1.0, 0.50 + (totalCodeMatches * 0.15));
+        if (javaMatches >= 2 || pythonMatches >= 2 || jsMatches >= 2 || sqlMatches >= 2) {
+            sourceCodeScore = Math.min(1.0, 0.5 + (javaMatches + pythonMatches + jsMatches + sqlMatches) * 0.15);
             categories.add(DetectionCategory.SOURCE_CODE);
             findings.add(FindingDetail.builder()
                     .category(DetectionCategory.SOURCE_CODE)
                     .findingType("PROPRIETARY_SOURCE_CODE")
                     .maskedSnippet("[SOURCE_CODE_BLOCK]")
                     .confidence(sourceCodeScore)
-                    .count(totalCodeMatches)
+                    .count(javaMatches + pythonMatches + jsMatches + sqlMatches)
                     .build());
         }
 
         // --- 5. BUSINESS CONFIDENTIAL ---
-        if (CONFIDENTIAL_DOC_PATTERN.matcher(body).find()) {
+        if (CONFIDENTIAL_DOC_PATTERN.matcher(text).find()) {
             confidentialScore = 0.90;
             categories.add(DetectionCategory.BUSINESS_CONFIDENTIAL);
             findings.add(FindingDetail.builder()
                     .category(DetectionCategory.BUSINESS_CONFIDENTIAL)
-                    .findingType("BUSINESS_CONFIDENTIAL_MARKER")
+                    .findingType("CONFIDENTIAL_MARKER")
                     .maskedSnippet("[CONFIDENTIAL_DOCUMENT]")
                     .confidence(0.90)
                     .count(1)
@@ -384,12 +746,12 @@ public class SecretDetectorService {
         }
 
         // --- 6. HR DATA ---
-        if (HR_DOC_PATTERN.matcher(body).find()) {
+        if (HR_DOC_PATTERN.matcher(text).find()) {
             hrScore = 0.85;
             categories.add(DetectionCategory.HR_DATA);
             findings.add(FindingDetail.builder()
                     .category(DetectionCategory.HR_DATA)
-                    .findingType("HR_EMPLOYEE_RECORD")
+                    .findingType("HR_EMPLOYEE_DATA")
                     .maskedSnippet("[HR_RECORD]")
                     .confidence(0.85)
                     .count(1)
@@ -397,7 +759,7 @@ public class SecretDetectorService {
         }
 
         // --- 7. LEGAL DATA ---
-        if (LEGAL_DOC_PATTERN.matcher(body).find()) {
+        if (LEGAL_DOC_PATTERN.matcher(text).find()) {
             legalScore = 0.85;
             categories.add(DetectionCategory.LEGAL_DATA);
             findings.add(FindingDetail.builder()
@@ -409,19 +771,20 @@ public class SecretDetectorService {
                     .build());
         }
 
-        return ContentAnalysisResult.builder()
-                .rawBody(body)
-                .sanitizedBody(currentBody)
-                .destinationHost(host)
-                .detectedCategories(categories)
+        boolean modified = !text.equals(currentText);
+
+        return TextDlpResult.builder()
+                .sanitizedText(currentText)
+                .modified(modified)
+                .categories(categories)
                 .findings(findings)
                 .secretTypes(secretTypes)
                 .piiCount(piiCount)
-                .financialDataIndicators(financialCount)
-                .sourceCodeConfidence(sourceCodeScore)
-                .businessConfidentialConfidence(confidentialScore)
-                .hrDataIndicators(hrScore)
-                .legalDataIndicators(legalScore)
+                .financialCount(financialCount)
+                .sourceCodeScore(sourceCodeScore)
+                .confidentialScore(confidentialScore)
+                .hrScore(hrScore)
+                .legalScore(legalScore)
                 .build();
     }
 

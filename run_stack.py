@@ -65,7 +65,8 @@ def main():
         env=gw_env
     )
     processes.append(gw_proc)
-    time.sleep(3)
+    time.sleep(6)
+
 
     # 3. Start mitmproxy Interceptor Addon
     log("3/4 Launching mitmproxy Interceptor Addon on port 8082 ...", "\033[96m")

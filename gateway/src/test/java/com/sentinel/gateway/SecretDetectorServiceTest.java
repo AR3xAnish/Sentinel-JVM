@@ -69,4 +69,53 @@ class SecretDetectorServiceTest {
         assertFalse(result.isRedactionOccurred());
         assertEquals(payload, result.getSanitizedBody());
     }
+
+    @Test
+    @DisplayName("Should extract and redact ChatGPT messages[].content.parts[] while preserving create_time and protocol metadata")
+    void testChatGptProtocolIntegrityAndPartsRedaction() {
+        String chatGptJson = "{\n" +
+                "  \"action\": \"next\",\n" +
+                "  \"messages\": [\n" +
+                "    {\n" +
+                "      \"id\": \"aaa272b5-1111-2222-3333-444455556666\",\n" +
+                "      \"author\": { \"role\": \"user\" },\n" +
+                "      \"create_time\": 1769304382.503,\n" +
+                "      \"content\": {\n" +
+                "        \"content_type\": \"text\",\n" +
+                "        \"parts\": [\n" +
+                "          \"Here is my client phone +1-555-0199 and email test@company.com\"\n" +
+                "        ]\n" +
+                "      },\n" +
+                "      \"metadata\": {}\n" +
+                "    }\n" +
+                "  ],\n" +
+                "  \"conversation_id\": \"conv-12345\",\n" +
+                "  \"parent_message_id\": \"msg-67890\",\n" +
+                "  \"model\": \"gpt-4o\"\n" +
+                "}";
+
+        SecretDetectorService.DetectionResult result = secretDetectorService.inspectBody(chatGptJson);
+
+        assertTrue(result.isRedactionOccurred());
+        String sanitized = result.getSanitizedBody();
+
+        // 1. Verify create_time is 100% preserved and NOT corrupted into [REDACTED_PHONE_NUMBER].503
+        assertTrue(sanitized.contains("1769304382.503"), "create_time numeric timestamp must be intact");
+        assertFalse(sanitized.contains("[REDACTED_PHONE_NUMBER].503"), "create_time must never be matched as phone number");
+
+        // 2. Verify protocol metadata is strictly preserved
+        assertTrue(sanitized.contains("\"conversation_id\":\"conv-12345\"") || sanitized.contains("\"conversation_id\": \"conv-12345\""));
+        assertTrue(sanitized.contains("\"parent_message_id\":\"msg-67890\"") || sanitized.contains("\"parent_message_id\": \"msg-67890\""));
+        assertTrue(sanitized.contains("\"model\":\"gpt-4o\"") || sanitized.contains("\"model\": \"gpt-4o\""));
+
+        // 3. Verify user content inside parts[] was accurately redacted
+        assertTrue(sanitized.contains("[REDACTED_PHONE_NUMBER]"));
+        assertTrue(sanitized.contains("[REDACTED_EMAIL]"));
+        assertFalse(sanitized.contains("test@company.com"));
+
+        // 4. Verify output is strictly valid parseable JSON
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        assertDoesNotThrow(() -> mapper.readTree(sanitized), "Sanitized output must be valid parseable JSON");
+    }
 }
+

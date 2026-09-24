@@ -55,16 +55,20 @@ public class DashboardController {
             flux = inspectionLogRepository.findByOrderByTimestampDesc(pageable);
         }
 
-        return flux.onErrorResume(e -> {
-            log.warn("Error retrieving events from MongoDB: {}. Returning empty stream.", e.getMessage());
-            return Flux.empty();
-        });
+        return flux
+                .timeout(java.time.Duration.ofSeconds(3))
+                .onErrorResume(e -> {
+                    log.warn("Error retrieving events from MongoDB: {}. Returning empty stream.", e.getMessage());
+                    return Flux.empty();
+                });
     }
 
     @GetMapping("/stats")
     public Mono<StatsResponse> getStats() {
         return inspectionLogRepository.findAll()
+                .take(500)
                 .collectList()
+                .timeout(java.time.Duration.ofSeconds(3))
                 .map(logs -> {
                     if (logs == null || logs.isEmpty()) {
                         return createEmptyStats();

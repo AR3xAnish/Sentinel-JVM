@@ -1,3 +1,4 @@
+com\sentinel\gateway\service\SecretDetectorService$TextDlpResult$TextDlpResultBuilder.class
 com\sentinel\gateway\config\MongoConfig$StringToActionConverter.class
 com\sentinel\gateway\model\InspectionResponse$InspectionResponseBuilder.class
 com\sentinel\gateway\model\ContentAnalysisResult.class
@@ -20,6 +21,7 @@ com\sentinel\gateway\SentinelGatewayApplication.class
 com\sentinel\gateway\service\PolicyService.class
 com\sentinel\gateway\service\AlertService.class
 com\sentinel\gateway\model\OrganizationPolicy$OrganizationPolicyBuilder.class
+com\sentinel\gateway\service\SecretDetectorService$TextDlpAccumulator.class
 com\sentinel\gateway\config\MongoConfig.class
 com\sentinel\gateway\controller\AlertController.class
 com\sentinel\gateway\service\SecretDetectorService$DetectionResult.class
@@ -42,6 +44,7 @@ com\sentinel\gateway\model\ContentAnalysisResult$ContentAnalysisResultBuilder.cl
 com\sentinel\gateway\model\AlertDocument$AlertDocumentBuilder.class
 com\sentinel\gateway\model\PolicyRule$PolicyRuleBuilder.class
 com\sentinel\gateway\controller\DashboardController.class
+com\sentinel\gateway\service\SecretDetectorService$TextDlpResult.class
 com\sentinel\gateway\service\RiskEvaluatorService$EvaluationResult.class
 com\sentinel\gateway\model\Action.class
 com\sentinel\gateway\model\PolicyDecision$PolicyDecisionBuilder.class

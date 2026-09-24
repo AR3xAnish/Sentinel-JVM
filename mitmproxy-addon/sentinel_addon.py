@@ -116,6 +116,8 @@ class SentinelMitmAddon:
                 elif decision == "REDACT" and redacted_body:
                     logger.info(f"REDACTED payload for request to {host}")
                     flow.request.text = redacted_body
+                    if "content-length" in flow.request.headers:
+                        flow.request.headers["content-length"] = str(len(flow.request.raw_content))
                     flow.request.headers["x-sentinel-action"] = "REDACTED"
                 else:
                     flow.request.headers["x-sentinel-action"] = "ALLOWED"
